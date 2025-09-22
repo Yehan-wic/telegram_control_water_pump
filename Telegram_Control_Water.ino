@@ -6,17 +6,17 @@
 using namespace ace_button;
 
 // Wi-Fi and Telegram Credentials
-const char* ssid = "SLT_FIBRE";  
-const char* password = "20002001";  
-const char* botToken = "8189177967:AAG3exlzaKTdxYcqHFFVoqREBiHfpZELZHA"; 
-const long chatID = 1483198598;  
+const char* ssid = "-----------";  
+const char* password = "-----------";  
+const char* botToken = "-----------"; 
+const long chatID = ------------;  
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(botToken, client);
 
 // Pin Definitions
-const int relayPin = 23;     // Relay connected to GPIO23
-const int switchPin = 19;    // Button connected to GPIO18
+const int relayPin = 23;     
+const int switchPin = 19;    
 #define soil_moisture_pin 32 
 #define LED_PIN 2
 #define RED_PIN   25
@@ -24,15 +24,15 @@ const int switchPin = 19;    // Button connected to GPIO18
 #define BLUE_PIN  27
 
 
-bool relayState = false;     // Track relay state
+bool relayState = false;     
 
 unsigned long relayOnTime = 0;
 unsigned long lastAutoTrigger = 0;
 unsigned long last15MinMessage = 0;
 
-const unsigned long ONE_HOUR = 60000;
-const unsigned long TWENTY_THREE_HOURS = 60000;  // 23h = 23 * 60 * 60 * 1000
-const unsigned long FIFTEEN_MINUTES = 15000;
+const unsigned long ONE_HOUR = 3600000;
+const unsigned long TWENTY_THREE_HOURS = 82800000;  
+const unsigned long FIFTEEN_MINUTES = 900000;
 
 bool isAutoRelayOn = false;
 bool isManualRelay = false;
@@ -50,7 +50,7 @@ void setup() {
 
   // Pin Setup
   pinMode(relayPin, OUTPUT);
-  digitalWrite(relayPin, LOW); // Turn off relay (active LOW)
+  digitalWrite(relayPin, LOW); 
   pinMode(switchPin, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   pinMode(RED_PIN, OUTPUT);
@@ -68,7 +68,7 @@ void setup() {
   Serial.println("\nConnected!");
  // digitalWrite(LED_PIN, HIGH);
 
-  client.setInsecure();  // Skip certificate check
+  client.setInsecure();  
 
   // Button Init
   buttonConfig.setEventHandler(buttonHandler);
