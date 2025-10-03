@@ -1,225 +1,344 @@
+#include <Wire.h>
+#include "RTClib.h"
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
-#include <AceButton.h>
 
-using namespace ace_button;
+// ====== WiFi & Telegram Config ======
+const char* ssid     = "Your Wifi Name";
+const char* password = "Your Wifi Password";
+#define BOT_TOKEN    "Your Telegram Bot Token"
+#define CHAT_ID      "Your Telegram Chat ID"
 
-// Wi-Fi and Telegram Credentials
-const char* ssid = "-----------";  
-const char* password = "-----------";  
-const char* botToken = "-----------"; 
-const long chatID = ------------;  
-
+// ====== Telegram Bot ======
 WiFiClientSecure client;
-UniversalTelegramBot bot(botToken, client);
+UniversalTelegramBot bot(BOT_TOKEN, client);
 
-// Pin Definitions
-const int relayPin = 23;     
-const int switchPin = 19;    
-#define soil_moisture_pin 32 
-#define LED_PIN 2
-#define RED_PIN   25
-#define GREEN_PIN 26
-#define BLUE_PIN  27
+// ====== RTC Config ======
+RTC_DS3231 rtc;
 
+// ====== Relay Config ======
+#define RELAY_PIN  23   // Relay connected to GPIO23
+bool relayState = false;
 
-bool relayState = false;     
+// ====== Wakeup Pin ======
+#define RTC_INT_PIN 13   // DS3231 INT pin connected here
 
-unsigned long relayOnTime = 0;
-unsigned long lastAutoTrigger = 0;
-unsigned long last15MinMessage = 0;
+// ====== Telegram Polling ======
+unsigned long lastCheckTime = 0;
+const long checkInterval = 2000; // check every 2 sec
 
-const unsigned long ONE_HOUR = 3600000;
-const unsigned long TWENTY_THREE_HOURS = 82800000;  
-const unsigned long FIFTEEN_MINUTES = 900000;
+// ====== Time Window ======
+const int START_HOUR = 10;        // irrigation start
+const int STOP_HOUR  = 15;        // irrigation stop
+const int MORNING_SYNC_HOUR = 8;  // morning RTC sync
 
-bool isAutoRelayOn = false;
-bool isManualRelay = false;
+// ====== NTP Config ======
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+const long gmtOffset = 5 * 3600 + 30 * 60; // Sri Lanka = +5h30m
+bool rtcSynced = false;
 
+// ====== WiFi Retry Config ======
+#define WIFI_RETRY_INTERVAL 120000       // 120s = 2 minutes
+#define MORNING_SYNC_TIMEOUT (5 * 60 * 1000) // 5 minutes max retry
 
-// AceButton Setup
-ButtonConfig buttonConfig;
-AceButton button(&buttonConfig);
+// ====== Buffered Messages Section ======
+#define MAX_BUFFERED_MSGS 10
+String msgBuffer[MAX_BUFFERED_MSGS];
+int msgCount = 0;
 
-void handleNewMessages(int numNewMessages);
-void buttonHandler(AceButton* button, uint8_t eventType, uint8_t buttonState);
+void bufferMessage(const String &msg) {
+  if (msgCount < MAX_BUFFERED_MSGS) {
+    msgBuffer[msgCount++] = msg;
+    Serial.println("📩 Message buffered: " + msg);
+  } else {
+    Serial.println("⚠️ Buffer full, dropping message: " + msg);
+  }
+}
 
+void flushBufferedMessages() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  for (int i = 0; i < msgCount; i++) {
+    if (bot.sendMessage(CHAT_ID, msgBuffer[i], "")) {
+      Serial.println("✅ Sent buffered message: " + msgBuffer[i]);
+    } else {
+      Serial.println("⚠️ Failed to send buffered message, keeping in buffer.");
+      return; // stop flushing if send fails
+    }
+  }
+  msgCount = 0; // clear buffer after success
+}
+
+void sendMessageSafe(const String &msg) {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (bot.sendMessage(CHAT_ID, msg, "")) {
+      Serial.println("✅ Sent: " + msg);
+    } else {
+      Serial.println("⚠️ Send failed, buffering message.");
+      bufferMessage(msg);
+    }
+  } else {
+    bufferMessage(msg);
+  }
+}
+
+// ====== Setup ======
 void setup() {
   Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
 
-  // Pin Setup
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(relayPin, LOW); 
-  pinMode(switchPin, INPUT_PULLUP);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(RED_PIN, OUTPUT);
-  pinMode(GREEN_PIN, OUTPUT);
-  pinMode(BLUE_PIN, OUTPUT);
+  // ====== Init I2C with custom pins ======
+  Wire.begin(27, 19); // SDA = GPIO27, SCL = GPIO19
+  Serial.println("I2C started on SDA=GPIO27, SCL=GPIO19");
 
-
-  // WiFi Connection
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // Init RTC
+  if (!rtc.begin(&Wire)) {
+    Serial.println("Couldn't find RTC");
+    while (1);
   }
-  Serial.println("\nConnected!");
- // digitalWrite(LED_PIN, HIGH);
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, setting time...");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); // fallback compile time
+  }
 
-  client.setInsecure();  
+  // Clear alarms
+  rtc.disableAlarm(1);
+  rtc.disableAlarm(2);
+  rtc.clearAlarm(1);
+  rtc.clearAlarm(2);
 
-  // Button Init
-  buttonConfig.setEventHandler(buttonHandler);
-  button.init(switchPin);
+  // Wake reason
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("🔔 Woke up from RTC alarm");
+  } else {
+    Serial.println("Normal boot");
+  }
+
+  DateTime now = rtc.now();
+  Serial.printf("⏱ Current RTC time: %02d:%02d:%02d\n", now.hour(), now.minute(), now.second());
+
+  // ====== Morning Sync at 8 AM ======
+  if (now.hour() == MORNING_SYNC_HOUR) {
+    Serial.println("🌅 Morning 8:00 AM wake: trying NTP sync...");
+    unsigned long start = millis();
+    bool synced = false;
+
+    while (millis() - start < MORNING_SYNC_TIMEOUT) {
+      if (connectWiFi()) {
+        if (syncRTCwithNTP()) {
+          Serial.println("🎯 RTC synced successfully at 8:00 AM.");
+          sendMessageSafe("⏱ RTC corrected with NTP at 8:00 AM.");
+          synced = true;
+          break;
+        }
+      }
+      Serial.println("⏳ Retry in 30s...");
+      delay(30000);
+    }
+
+    if (!synced) {
+      Serial.println("⚠️ Failed to sync RTC at 8:00 AM within 5 minutes.");
+      sendMessageSafe("⚠️ Failed to sync RTC at 8:00 AM.");
+    }
+
+    // Always schedule next wake at 10:00 AM
+    setRTCAlarmFor(START_HOUR, 0);
+    goToDeepSleep();
+  }
+
+  // ====== Main Irrigation Logic ======
+  if (now.hour() >= START_HOUR && now.hour() < STOP_HOUR) {
+    // ✅ Start irrigation immediately
+    if (!relayState) {
+      relayState = true;
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.println("💧 Irrigation started (failsafe check).");
+      sendMessageSafe("💧 Irrigation started (failsafe recovery).");
+    }
+
+    // 🌐 Try NTP sync after relay is ON
+    syncRTCwithNTP_retry();
+
+    // Stay awake until STOP_HOUR
+    stayAwakeUntilStop();
+    relayState = false;
+    digitalWrite(RELAY_PIN, LOW);
+    Serial.println("⏹️ Irrigation stopped at 3:00 PM.");
+    sendMessageSafe("⏹️ Irrigation stopped at 3:00 PM.");
+
+    setRTCAlarmFor(MORNING_SYNC_HOUR, 0); // Next wakeup tomorrow 8 AM for sync
+    goToDeepSleep();
+  }
+  else if (now.hour() >= STOP_HOUR) {
+    relayState = false;
+    digitalWrite(RELAY_PIN, LOW);
+    Serial.println("⏹️ Past irrigation window. Sleeping until 8:00 AM tomorrow.");
+    setRTCAlarmFor(MORNING_SYNC_HOUR, 0);
+    goToDeepSleep();
+  }
+  else {
+    relayState = false;
+    digitalWrite(RELAY_PIN, LOW);
+    Serial.println("💤 Before irrigation window. Sleeping until 8:00 AM.");
+    setRTCAlarmFor(MORNING_SYNC_HOUR, 0);
+    goToDeepSleep();
+  }
 }
-
-unsigned long lastSoilCheck = 0;
-const unsigned long soilCheckInterval = 2000;  // Check every 2 seconds
 
 void loop() {
-  button.check(); // Check button input
+  flushBufferedMessages(); // retry unsent messages
+  delay(5000);             // check every 5s
+}
 
-  int newMessages = bot.getUpdates(bot.last_message_received + 1);
-  if (newMessages > 0) {
-    handleNewMessages(newMessages);
-  }
-  
-
-  unsigned long now = millis();
-
-  // Soil check every 2 seconds
-  static unsigned long lastSoilCheck = 0;
-  if (now - lastSoilCheck >= 2000) {
-    lastSoilCheck = now;
-    updateLEDState();
+// ====== Sync RTC with NTP (single attempt) ======
+bool syncRTCwithNTP() {
+  timeClient.begin();
+  if (!timeClient.update()) {
+    timeClient.forceUpdate();
   }
 
-  // === Auto Relay Scheduler ===
-  if ((now - lastAutoTrigger >= ONE_HOUR + TWENTY_THREE_HOURS) || lastAutoTrigger == 0) {
-    lastAutoTrigger = now;
+  unsigned long epochTime = timeClient.getEpochTime();
+  if (epochTime < 100000) return false;
 
-    int moisture = analogRead(soil_moisture_pin);
-    if (moisture >= 1990) {
-      relayState = true;
-      isAutoRelayOn = true;
-      isManualRelay = false;
+  epochTime += gmtOffset;
+  rtc.adjust(DateTime(epochTime));
+  rtcSynced = true;
 
-      digitalWrite(relayPin, HIGH);
-      updateLEDState();
-      bot.sendMessage(String(chatID), "Auto Relay ON for irrigation.", "");
-      relayOnTime = now;
-      last15MinMessage = now;  // start 15 min timer
-    } else {
-      String msg = "Relay tried to turn ON, but soil moisture is sufficient.\nADC: " + String(moisture);
-      bot.sendMessage(String(chatID), msg, "");
+  DateTime now = rtc.now();
+  Serial.printf("✅ RTC synced to NTP (local time): %02d:%02d:%02d\n",
+                now.hour(), now.minute(), now.second());
+  return true;
+}
+
+void syncRTCwithNTP_retry() {
+  Serial.println("🌐 Trying to sync RTC with NTP...");
+  int attempts = 0;
+  while (attempts < 10) {
+    if (connectWiFi()) {
+      if (syncRTCwithNTP()) {
+        Serial.println("🎯 RTC successfully synced with NTP!");
+        return;
+      }
     }
+    attempts++;
+    Serial.println("⏳ NTP sync failed, retrying in 30s...");
+    delay(30000);
   }
+  Serial.println("⚠️ RTC sync failed after retries.");
+}
 
-  // === Auto Relay OFF After 1 Hour ===
-  if (isAutoRelayOn && now - relayOnTime >= ONE_HOUR) {
-    relayState = false;
-    isAutoRelayOn = false;
-    digitalWrite(relayPin, LOW);
-    updateLEDState();
-    bot.sendMessage(String(chatID), "Auto Relay OFF after 1 hour.", "");
+// ====== Set RTC Alarm ======
+void setRTCAlarmFor(int targetHour, int targetMinute) {
+  DateTime now = rtc.now();
+  DateTime target(now.year(), now.month(), now.day(), targetHour, targetMinute, 0);
+  if (now >= target) {
+    target = target + TimeSpan(1, 0, 0, 0);
   }
+  rtc.setAlarm2(target, DS3231_A2_Hour);
+  rtc.clearAlarm(2);
+  rtc.writeSqwPinMode(DS3231_OFF);
+  Serial.printf("⏰ Alarm set for %02d:%02d\n", target.hour(), target.minute());
+}
 
-  // === Send Message Every 15 Minutes if Relay is ON ===
-  if ((relayState) && (now - last15MinMessage >= FIFTEEN_MINUTES)) {
-    last15MinMessage = now;
-    bot.sendMessage(String(chatID), "Relay is ON (auto/manual) - running irrigation.", "");
-  }
-
-
-  if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, HIGH);  // ON = connected
-  } else {
-    digitalWrite(LED_PIN, LOW);   // OFF = not connected
-  }
-
+// ====== Deep Sleep ======
+void goToDeepSleep() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
   delay(100);
+  pinMode(RTC_INT_PIN, INPUT_PULLUP);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)RTC_INT_PIN, 0);
+  Serial.println("💤 Going to deep sleep...");
+  esp_deep_sleep_start();
 }
 
-void setRGB(bool r, bool g, bool b) {
-  digitalWrite(RED_PIN,   r ? HIGH : LOW);
-  digitalWrite(GREEN_PIN, g ? HIGH : LOW);
-  digitalWrite(BLUE_PIN,  b ? HIGH : LOW);
-}
+// ====== Stay Awake Until STOP_HOUR ======
+void stayAwakeUntilStop() {
+  Serial.println("📡 Staying awake until stop time...");
+  while (true) {
+    DateTime now = rtc.now();
+    if (now.hour() >= STOP_HOUR) break;
 
-void updateLEDState() {
-  if (relayState) {
-    // Relay is ON → Green
-    setRGB(false, true, false);
-  } else {
-    // Relay is OFF → Use soil moisture
-    int value = analogRead(soil_moisture_pin);
-    if (value < 1990) {
-      setRGB(false, false, true);  // Blue
-    } else {
-      setRGB(true, false, false);  // Red
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("⚠️ WiFi lost! Retrying...");
+      if (connectWiFi()) {
+        Serial.println("✅ WiFi reconnected.");
+        flushBufferedMessages();
+        syncRTCwithNTP();
+      }
     }
-  }
 
+    if (WiFi.status() == WL_CONNECTED && millis() - lastCheckTime > checkInterval) {
+      int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+      while (numNewMessages) {
+        handleNewMessages(numNewMessages);
+        numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+      }
+      lastCheckTime = millis();
+    }
+
+    flushBufferedMessages();
+    delay(WIFI_RETRY_INTERVAL); // retry every 120s
+  }
+  Serial.println("⌛ Control window closed.");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
 }
 
-
+// ====== Handle Telegram Commands ======
 void handleNewMessages(int numNewMessages) {
   for (int i = 0; i < numNewMessages; i++) {
-    String chat_id = bot.messages[i].chat_id;
-    if (chat_id.toInt() != chatID) continue;
+    String chat_id = String(bot.messages[i].chat_id);
+    if (chat_id != CHAT_ID) continue;
 
     String text = bot.messages[i].text;
-    Serial.println("Command: " + text);
-
-    if (text == "/relay_on") {
+    if (text == "/on") {
       relayState = true;
-      isManualRelay = true;
-      isAutoRelayOn = false;
-      digitalWrite(relayPin, HIGH);
-      bot.sendMessage(chat_id, "Relay is ON", "");
-      updateLEDState();
-    } else if (text == "/relay_off") {
+      digitalWrite(RELAY_PIN, HIGH);
+      sendMessageSafe("✅ Relay turned ON by command.");
+    }
+    else if (text == "/off") {
       relayState = false;
-      isManualRelay = false;
-      isAutoRelayOn = false;
-      digitalWrite(relayPin, LOW);
-      bot.sendMessage(chat_id, "Relay is OFF", "");
-      updateLEDState();
-    } else if (text == "/relay_state") {
-      String stateMsg = String("Relay is ") + (relayState ? "ON" : "OFF");
-      bot.sendMessage(chat_id, stateMsg, "");
-    } else if (text == "/moisture") {
-      int value = analogRead(soil_moisture_pin);
-      int percent = map(value, 0, 4095, 0, 100);  // You can reverse if sensor behaves oppositely
-      String msg = "Soil Moisture: " + String(percent) + "%\nRaw ADC Value: " + String(value);
-      bot.sendMessage(chat_id, msg, "");
-      updateLEDState();
-
-    } else {
-      bot.sendMessage(chat_id, "Valid commands:\n/relay_on\n/relay_off\n/relay_state\n/moisture", "");
+      digitalWrite(RELAY_PIN, LOW);
+      sendMessageSafe("❌ Relay turned OFF by command.");
+    }
+    else if (text == "/status") {
+      String status = relayState ? "ON 💡" : "OFF ❌";
+      DateTime now = rtc.now();
+      char buf[40];
+      sprintf(buf, "📊 Relay: %s | Time: %02d:%02d:%02d",
+              status.c_str(), now.hour(), now.minute(), now.second());
+      sendMessageSafe(buf);
+    }
+    else if (text == "/time") {
+      DateTime now = rtc.now();
+      char buf[30];
+      sprintf(buf, "⏱ Current time: %02d:%02d:%02d", now.hour(), now.minute(), now.second());
+      sendMessageSafe(buf);
+    }
+    else {
+      sendMessageSafe("⚡ Commands: /on /off /status /time (10 AM–3 PM only)");
     }
   }
 }
 
-// Button Event Handler
-void buttonHandler(AceButton* button, uint8_t eventType, uint8_t buttonState) {
-  if (eventType == AceButton::kEventPressed) {
-    relayState = !relayState; // Toggle state
-    isManualRelay = relayState;  // Manual ON/OFF toggle
-    isAutoRelayOn = false;       // Override auto mode
-
-    // Set the relay pin (active LOW)
-    digitalWrite(relayPin, relayState ? HIGH : LOW);
-
-    // Print to Serial
-    Serial.println(relayState ? "Button Pressed - Relay ON" : "Button Pressed - Relay OFF");
-
-    // Send message to Telegram bot
-    String msg = relayState ? "Relay is ON - button pressed" : "Relay is OFF - button pressed";
-    bot.sendMessage(String(chatID), msg, "");
-    updateLEDState();
+// ====== WiFi connect helper ======
+bool connectWiFi() {
+  WiFi.begin(ssid, password);
+  client.setInsecure();
+  Serial.print("Connecting to WiFi");
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(1000);
+    Serial.print(".");
+    retries++;
   }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
 }
+
 
